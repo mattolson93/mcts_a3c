@@ -1,18 +1,15 @@
 # Baby Advantage Actor-Critic | Sam Greydanus | October 2017 | MIT License
 
 from __future__ import print_function
-
-import torch, os, gym, time, glob, argparse
+import torch, os, gym, time, glob, argparse, sys
 import numpy as np
 from scipy.signal import lfilter
 from scipy.misc import imresize # preserves single-pixel info _unlike_ img = img[::2,::2]
 
 import torch.nn as nn
-from time import sleep
 from torch.autograd import Variable
 import torch.nn.functional as F
 import torch.multiprocessing as mp
-from copy import deepcopy
 os.environ['OMP_NUM_THREADS'] = '1'
 
 parser = argparse.ArgumentParser(description=None)
@@ -92,155 +89,9 @@ info = {k : torch.DoubleTensor([0]).share_memory_() for k in ['run_epr', 'run_lo
 info['frames'] += shared_model.try_load(args.save_dir)*1e6
 if int(info['frames'][0]) == 0: printlog(args,'', end='', mode='w') # clear log file
 
-class CustomException(Exception):
-    pass
-
-class FullState(object):
-    render = False
-
-    def __init__(self, model = None, env = None, state = None, cx = None, hx = None, episode_length = None, lstm_steps = None):
-        self.total_reward = 0
-        self.lstm_steps = lstm_steps
-        self.model = model
-        self.env = env
-        self.state = state
-        self.cx = cx
-        self.hx = hx
-        self.episode_length = episode_length
-        self.old_state = None
-        self.pi_action = None
-        self.value = None
-
-    def restore_state(self):
-        if self.old_state is None:
-            raise CustomException("Tried to restore a full state without making a copy!")
-
-        #self = FullState(self.old_state) #does this work?
-        self.lstm_steps = self.old_state.lstm_steps
-        self.model = self.old_state.model
-        #old_state.env is actuall just an array
-        self.env.restore_state(self.old_state.env)
-
-        self.state = self.old_state.state
-        self.cx = self.old_state.cx
-        self.hx = self.old_state.hx
-        self.episode_length = self.old_state.episode_length
-
-        self.old_state = None
-
-
-    def save_state(self):
-        lstm_steps_copy = deepcopy(self.lstm_steps)
-        model_copy = deepcopy(self.model)
-        env_copy = self.env.clone_state()
-        state_copy = self.state.clone()
-        cx_copy = self.cx.clone()
-        hx_copy = self.hx.clone()
-        episode_length_copy = deepcopy(self.episode_length)
-
-        self.old_state = FullState(model_copy, env_copy, state_copy, cx_copy, hx_copy, episode_length_copy,lstm_steps_copy)
-
-    
-    def init_game(self, args, initial_frames):
-        self.lstm_steps = args.lstm_steps
-        self.env = gym.make(args.env) # make a local (unshared) environment
-        self.env.seed(args.seed) 
-        self.env = self.env.unwrapped
-        torch.manual_seed(args.seed ) # seed everything
-    
-        self.model = NNPolicy(channels=1, num_actions=args.num_actions)
-        self.model.load_state_dict(shared_model.state_dict())
-        self.state = torch.Tensor(prepro(self.env.reset())) # get first state
-        self.cx = Variable(torch.zeros(1, 256)) # lstm memory vector
-        self.hx = Variable(torch.zeros(1, 256)) # lstm activation vector
-        self.episode_length = 0
-        
-        for _ in range(initial_frames):
-            self.take_single_action(None)
-
-    def take_single_action(self, action):
-        self._run_model()
-
-        if action is None: action = self.pi_action
-
-        self.episode_length += 1
-        self.state, reward, done, _ = self.env.step(action)
-        if FullState.render: self.env.render()
-
-        self.state = torch.Tensor(prepro(self.state)) 
-        reward = np.clip(reward, -1, 1) # reward from game
-        done = done or self.episode_length >= 3e4 # keep agent from playing one episode too long
-        #self.total_reward += reward
-        #print(str(self.value) + "," + str(reward) +","+ str(self.total_reward + self.value))
-        if done: # update shared data. maybe print info.
-            self.episode_length = 0
-            self.state = torch.Tensor(prepro(self.env.reset()))
-
-    #this should only be called from take single action
-    def _run_model(self):
-        #dont let the memory vectors get out of hand
-        if self.episode_length % self.lstm_steps == 0:
-            self.cx = Variable(self.cx.data)
-            self.hx = Variable(self.hx.data)
-
-        value, logit, (hx, cx) = self.model((Variable(self.state.view(1,1,80,80)), (self.hx, self.cx)))
-        logp = F.log_softmax(logit)
-        action = logp.max(1)[1].data 
-
-        self.pi_action = action.numpy()[0]
-        self.value = value.data.cpu().numpy()[0][0]
-
-    def _get_discounted_r(self, values, rewards):
-        np_values = values.view(-1).data.numpy()
-    
-        # l2 loss over value estimator
-        rewards[-1] += args.gamma * np_values[-1]
-        return discount(np.asarray(rewards), args.gamma)
-        
-        
-
-
-#strategies
-def left_only(cur_state):
-    return 0
-
-def pi(full_state):
-    return None
-
-#end strategies
-
-
-def get_action(cur_state, strategy_function):
-    return  globals()[strategy_function](cur_state)
-
-
-def rollout(complete_state, num_frames, rollouts, strategy):
-    vals = []
-    for _ in range(rollouts):
-        complete_state.save_state()
-        for _ in range(num_frames):
-            action = get_action(complete_state, strategy)
-            complete_state.take_single_action(action)
-
-        vals.append(complete_state.value)
-        complete_state.restore_state()
-    
-    best_action = 0
-    print("mcts decided best action is" + str(best_action))
-    #todo, actually return a torch valiable so we can backprop
-    return best_action
-    #return complete_state, sum(vals)/float(rollouts)
-
-
-
-def perform_mcts(total_frames, cur_episode_length):
-    return cur_episode_length == 1
-    #return False
-
 def train(rank, args, info):
     env = gym.make(args.env) # make a local (unshared) environment
     env.seed(args.seed + rank) ; torch.manual_seed(args.seed + rank) # seed everything
-    env = env.unwrapped
     model = NNPolicy(channels=1, num_actions=args.num_actions) # init a local (unshared) model
     state = torch.Tensor(prepro(env.reset())) # get first state
 
@@ -259,13 +110,8 @@ def train(rank, args, info):
             value, logit, (hx, cx) = model((Variable(state.view(1,1,80,80)), (hx, cx)))
             logp = F.log_softmax(logit, dim=1)
 
-            num_frames, rollouts, strategy = 20, 1, "pi"
-
             action = logp.max(1)[1].data if args.test else torch.exp(logp).multinomial().data[0]
-            act = action.numpy()[0]
-            if perform_mcts(info['frames'], episode_length):
-                act = rollout(FullState(model, env, state, cx, hx, episode_length, args.lstm_steps), num_frames, rollouts, strategy)
-            state, reward, done, _ = env.step(act)
+            state, reward, done, _ = env.step(action.numpy()[0])
             if args.render: env.render()
 
             state = torch.Tensor(prepro(state)) ; epr += reward
@@ -306,7 +152,6 @@ def train(rank, args, info):
             if shared_param.grad is None: shared_param._grad = param.grad # sync gradients with shared model
         shared_optimizer.step()
 
-
 def cost_func(values, logps, actions, rewards):
     np_values = values.view(-1).data.numpy()
 
@@ -324,3 +169,16 @@ def cost_func(values, logps, actions, rewards):
 
     entropy_loss = -(-logps * torch.exp(logps)).sum() # encourage lower entropy
     return policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
+
+if __name__ == "__main__":
+	if sys.version_info[0] > 2:
+		mp.set_start_method("spawn") #this must not be in global scope
+	elif sys.platform == 'linux' or sys.platform == 'linux2': 
+		raise "Must be using Python 3 with linux!" #or else you get a deadlock in conv2d
+
+	processes = []
+	for rank in range(args.processes):
+		p = mp.Process(target=train, args=(rank, args, info))
+		p.start() ; processes.append(p)
+	for p in processes:
+		p.join()

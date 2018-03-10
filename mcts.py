@@ -4,38 +4,11 @@
 
 import a3c_mcts as a3c
 
+a3c.train(0,a3c.args,a3c.info)
+'''
 
-#strategies
-def left_only(cur_state):
-    return 0
-
-def pi(full_state):
-    return None
-
-#end strategies
-
-
-
-def get_action(cur_state, strategy_function):
-    return  globals()[strategy_function](cur_state)
-
-
-def rollout(complete_state, num_frames, rollouts, strategy):
-    vals = []
-    for _ in range(rollouts):
-        complete_state.save_state()
-        for _ in range(num_frames):
-            action = get_action(complete_state, strategy)
-            complete_state.take_single_action(action)
-
-        vals.append(complete_state.value)
-        complete_state.restore_state()
-
-    return complete_state, sum(vals)/float(rollouts)
-
-
-start_frames = 100
-frames = [100]
+start_frames = 1001
+frames = []
 rollouts = 5
 
 
@@ -51,5 +24,21 @@ for num_frames in frames:
     print("val pi: " + str(value_pi))
     complete_state, value_left = rollout(complete_state, num_frames, rollouts, "left_only")
     print("val left: " + str(value_pi))
+
+
+if __name__ == "__main__":
+	if sys.version_info[0] > 2:
+		mp.set_start_method("spawn") #this must not be in global scope
+	elif sys.platform == 'linux' or sys.platform == 'linux2': 
+		raise "Must be using Python 3 with linux!" #or else you get a deadlock in conv2d
+    
+    
+	processes = []
+	for rank in range(args.processes):
+		p = mp.Process(target=train, args=(rank, args, info))
+		p.start() ; processes.append(p)
+	for p in processes:
+		p.join()
+    '''
 
 #print complete_state
