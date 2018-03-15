@@ -13,6 +13,9 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 import torch.multiprocessing as mp
 from copy import deepcopy
+import matplotlib
+matplotlib.use('agg')
+import matplotlib.pyplot as plt
 os.environ['OMP_NUM_THREADS'] = '1'
 
 parser = argparse.ArgumentParser(description=None)
@@ -110,6 +113,10 @@ class FullState(object):
         self.old_state = None
         self.pi_action = None
         self.value = None
+        self.values = []
+        self.logps = []
+        self.actions = []
+        self.rewards = []
 
     def restore_state(self):
         if self.old_state is None:
@@ -118,6 +125,8 @@ class FullState(object):
         #self = FullState(self.old_state) #does this work?
         self.lstm_steps = self.old_state.lstm_steps
         self.model = self.old_state.model
+        self.model.load_state_dict(shared_model.state_dict())
+
         #old_state.env is actuall just an array
         self.env.restore_state(self.old_state.env)
 
@@ -126,6 +135,10 @@ class FullState(object):
         self.hx = self.old_state.hx
         self.episode_length = self.old_state.episode_length
 
+        self.values = []
+        self.logps = []
+        self.actions = []
+        self.rewards = []
         self.old_state = None
 
 
@@ -176,6 +189,10 @@ class FullState(object):
             self.episode_length = 0
             self.state = torch.Tensor(prepro(self.env.reset()))
 
+        self.actions.append(torch.LongTensor([action.item()]))
+        self.rewards.append(reward)
+        
+
     #this should only be called from take single action
     def _run_model(self):
         #dont let the memory vectors get out of hand
@@ -187,6 +204,8 @@ class FullState(object):
         logp = F.log_softmax(logit)
         action = logp.max(1)[1].data 
 
+        self.values.append(value)
+        self.logps.append(logp)
         self.pi_action = action.numpy()[0]
         self.value = value.data.cpu().numpy()[0][0]
 
@@ -196,6 +215,18 @@ class FullState(object):
         # l2 loss over value estimator
         rewards[-1] += args.gamma * np_values[-1]
         return discount(np.asarray(rewards), args.gamma)
+
+    def back_prop(self):
+        next_value = self.model((Variable(self.state.unsqueeze(0)), (self.hx, self.cx)))[0]
+        self.values.append(Variable(next_value.data))
+
+        loss = cost_func(torch.cat(self.values), torch.cat(self.logps), torch.cat(self.actions), np.asarray(self.rewards))
+        shared_optimizer.zero_grad() ; loss.backward(retain_graph=True)
+        torch.nn.utils.clip_grad_norm(self.model.parameters(), 40)
+
+        for param, shared_param in zip(self.model.parameters(), shared_model.parameters()):
+            if shared_param.grad is None: shared_param._grad = param.grad # sync gradients with shared model
+        shared_optimizer.step()
         
         
 
@@ -216,25 +247,26 @@ def get_action(cur_state, strategy_function):
 
 def rollout(complete_state, num_frames, rollouts, strategy):
     vals = []
-    for _ in range(rollouts):
+    for r in range(rollouts):
         complete_state.save_state()
         for _ in range(num_frames):
+            #save_frame(complete_state.env, args.save_dir + 'imgs/', complete_state.episode_length, str(r))
             action = get_action(complete_state, strategy)
             complete_state.take_single_action(action)
 
         vals.append(complete_state.value)
+        complete_state.back_prop()
         complete_state.restore_state()
     
     best_action = 0
     print("mcts decided best action is" + str(best_action))
-    #todo, actually return a torch valiable so we can backprop
     return best_action
     #return complete_state, sum(vals)/float(rollouts)
 
 
 
 def perform_mcts(total_frames, cur_episode_length):
-    return cur_episode_length == 1
+    return cur_episode_length == 21
     #return False
 
 def train(rank, args, info):
@@ -258,15 +290,17 @@ def train(rank, args, info):
             episode_length += 1
             value, logit, (hx, cx) = model((Variable(state.view(1,1,80,80)), (hx, cx)))
             logp = F.log_softmax(logit, dim=1)
-
-            num_frames, rollouts, strategy = 20, 1, "pi"
+            
+            num_frames, rollouts, strategy = 10, 5, "pi"
 
             action = logp.max(1)[1].data if args.test else torch.exp(logp).multinomial().data[0]
             act = action.numpy()[0]
             if perform_mcts(info['frames'], episode_length):
                 act = rollout(FullState(model, env, state, cx, hx, episode_length, args.lstm_steps), num_frames, rollouts, strategy)
             state, reward, done, _ = env.step(act)
-            if args.render: env.render()
+            
+            if args.render: #env.render()
+                save_frame(env, args.save_dir + 'imgs/', episode_length)
 
             state = torch.Tensor(prepro(state)) ; epr += reward
             reward = np.clip(reward, -1, 1) # reward
@@ -324,3 +358,14 @@ def cost_func(values, logps, actions, rewards):
 
     entropy_loss = -(-logps * torch.exp(logps)).sum() # encourage lower entropy
     return policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
+
+def save_frame(env, save_dir , step=0, info=""):
+    file_name = "%s_step_%s" % (env.spec.id,info+str(step).zfill(6))
+    title = file_name + info
+
+    plt.figure(3)
+    plt.clf()
+    plt.imshow(env.render(mode='rgb_array'))
+    plt.title(title)
+    plt.axis('off')
+    plt.savefig(save_dir + file_name)
